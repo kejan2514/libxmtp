@@ -16,10 +16,27 @@ jobs:
         with:
           ref: fix/1109-replace-clap-with-lexopt
           fetch-depth: 0
-      - name: Resolve only lexopt in Cargo.lock
+      - name: Apply minimal Cargo.lock edit
         run: |
           git checkout a8710c7a7a87235730809ef408da2ac97b54f266 -- Cargo.lock
-          cargo update -p lexopt --precise 0.3.2
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('Cargo.lock')
+          s = p.read_text()
+          marker = '[[package]]\nname = "libc"'
+          lexopt = '''[[package]]\nname = "lexopt"\nversion = "0.3.2"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "803ec87c9cfb29b9d2633f20cba1f488db3fd53f2158b1024cbefb47ba05d413"\n\n'''
+          if 'name = "lexopt"' not in s:
+              s = s.replace(marker, lexopt + marker, 1)
+          start = s.index('name = "mls_validation_service"')
+          end = s.index('\n[[package]]', start)
+          block = s[start:end]
+          if ' "clap",' not in block:
+              raise SystemExit('clap dependency not found in mls_validation_service lock entry')
+          block = block.replace(' "clap",', ' "lexopt",', 1)
+          s = s[:start] + block + s[end:]
+          p.write_text(s)
+          PY
+          git diff --check
       - name: Commit Cargo.lock
         run: |
           git config user.name "github-actions[bot]"
