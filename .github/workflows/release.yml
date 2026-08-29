@@ -54,9 +54,6 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    # Nightly: 06:00 UTC daily (~11pm PT / 02am ET). Schedule-only, never manual.
-    - cron: "0 6 * * *"
 
 jobs:
   validate:
@@ -155,13 +152,6 @@ jobs:
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-  # Nightly blocking relies on TWO mechanisms that must BOTH be preserved (see hub job below):
-  #  1. gate-skip == 'true' (a legitimate "not green yet" skip; gate job succeeds), and
-  #  2. job-dependency skip on plan FAILURE.
-  # The cross-test gate + version oracle live in the reusable release-gate-plan
-  # workflow (one source of truth, shared with nightly-dry-run.yml). This `plan`
-  # job runs it for the real nightly. Outputs: sha, gate-skip, version, kind,
-  # nothing-pending.
   plan:
     needs: [validate]
     if: needs.validate.outputs.release-type == 'nightly' && needs.validate.outputs.skip != 'true'
@@ -238,9 +228,6 @@ jobs:
       dry-run: ${{ needs.validate.outputs.dry-run == 'true' }}
     secrets: inherit
 
-  # Depends on release-node-sdk so the published agent-sdk pins the node-sdk
-  # version shipped by this same run; when node-sdk is deselected (skipped),
-  # the empty version input falls back to npm latest inside the workflow.
   release-agent-sdk:
     needs: [validate, plan, release-node-sdk]
     if: >-
@@ -260,9 +247,6 @@ jobs:
     secrets: inherit
 
   merge-pr:
-    # dry-run must not mutate the repo: a final + dry-run would otherwise merge
-    # and delete the release branch even though the release-* jobs were skipped
-    # (skipped ≠ failure, so the !contains(failure) check alone lets it through).
     if: needs.validate.outputs.release-type == 'final' && !inputs.no-merge && !cancelled() && !contains(needs.*.result, 'failure') && needs.validate.outputs.dry-run != 'true'
     needs: [validate, release-ios, release-android, release-node-sdk, release-browser-sdk, release-agent-sdk]
     runs-on: ubuntu-latest
@@ -284,24 +268,8 @@ jobs:
             echo "No PR found for branch $BRANCH targeting main"
             exit 1
           fi
-          # main's ruleset allows squash merges only — --merge always fails
-          # ("base branch policy prohibits the merge", 1.11.0 postmortem).
-          # Keep the branch: release/v* branches are long-lived maintenance lines.
           gh pr merge "$PR_NUMBER" --squash
 
-  # Nightly blocking + non-nightly compatibility rely on the `if` pattern shared
-  # by the release-* jobs and this hub job:
-  #   !cancelled() && !contains(needs.*.result, 'failure') && <type/gate clauses>
-  # Why each piece matters:
-  #  - `!cancelled()` forces the `if` to be EVALUATED even when a `needs` job was
-  #    SKIPPED. Without it, gate/pending being skipped for dev/rc/final auto-skips
-  #    every release-* job (GitHub's implicit success() on needs) — which silently
-  #    breaks all non-nightly releases.
-  #  - `!contains(needs.*.result, 'failure')` still blocks when a needs job (e.g. a
-  #    nightly gate error) FAILED — fail-closed for nightlies.
-  #  - the `gate-skip != 'true'` clause blocks a nightly when cross-test isn't green.
-  # Do NOT drop any of the three; they jointly make non-nightly run and nightly
-  # block-on-not-green / block-on-error.
   hub:
     needs: [validate, plan, release-ios, release-android, release-node-sdk, release-browser-sdk, release-agent-sdk]
     if: >-
@@ -310,11 +278,6 @@ jobs:
       && needs.plan.outputs.nothing-pending != 'true'
       && needs.validate.outputs.dry-run != 'true'
       && !cancelled() && !contains(needs.*.result, 'failure')
-    # Serialize hub runs for the same pending version so two overlapping nightly
-    # runs (e.g. cron + a manual dispatch) can't both create the same tag/release
-    # and race on `gh release create`. Scoped to the pending version (resolved by
-    # the `plan` job); cancel-in-progress: false so a second run waits rather
-    # than clobbering an in-flight tag/release.
     concurrency:
       group: hub-release-${{ needs.plan.outputs.version }}
       cancel-in-progress: false
@@ -327,11 +290,6 @@ jobs:
           ref: ${{ needs.validate.outputs.ref }}
           fetch-depth: 0
       - uses: ./.github/actions/setup-release-tools
-      # Don't mint an empty hub release. A manual nightly dispatch can disable
-      # every SDK (ios=android=node=wasm=false), which would otherwise produce a
-      # libxmtp Release with an all-"—" rollup. Require at least one SDK to have
-      # shipped a version. (The cron path always enables all four, so this only
-      # guards manual dispatch.)
       - name: Guard against empty rollup
         id: guard
         env:
@@ -343,138 +301,33 @@ jobs:
           set -euo pipefail
           if [ -z "${IOS_VERSION}${ANDROID_VERSION}${NODE_VERSION}${WASM_VERSION}" ]; then
             echo "should-release=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No SDK shipped a version; skipping the empty hub release."
+            echo "::notice::No SDK shipped a version; skipping hub release."
           else
             echo "should-release=true" >> "$GITHUB_OUTPUT"
           fi
-      - name: Compute libxmtp hub version
-        id: hubver
-        if: steps.guard.outputs.should-release == 'true'
-        run: |
-          set -euo pipefail
-          VERSION=$(xmtp-release resolve-sdk-version \
-            --sdk libxmtp --release-type nightly \
-            --pending-version "${{ needs.plan.outputs.version }}" \
-            --pending-kind "${{ needs.plan.outputs.kind }}")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - name: Install git-cliff
-        if: steps.guard.outputs.should-release == 'true'
-        run: |
-          set -euo pipefail
-          cargo binstall -y git-cliff --version 2.13.1 \
-            || cargo install git-cliff --version 2.13.1 --locked
-          git cliff --version
-      # Per-nightly changelog: the delta since the PREVIOUS nightly tag (not
-      # since the last stable). Computed BEFORE tagging this run, so the newest
-      # existing v*-nightly.* tag is genuinely the prior nightly. First-ever
-      # nightly (no prior nightly tag) falls back to since-last-stable.
-      - name: Compute per-nightly changelog
-        id: nightly_changelog
-        if: steps.guard.outputs.should-release == 'true'
-        run: |
-          set -euo pipefail
-          PREV_NIGHTLY=$(git tag -l 'v*-nightly.*' --sort=-creatordate | head -1 || true)
-          if [ -n "$PREV_NIGHTLY" ]; then
-            echo "::notice::Changelog range ${PREV_NIGHTLY}..HEAD"
-            git cliff --config cliff.toml "${PREV_NIGHTLY}..HEAD" --strip header > /tmp/nightly-changelog.md 2>/dev/null || true
-          else
-            echo "::notice::No prior nightly tag; changelog falls back to since-last-stable."
-            git cliff --config cliff.toml --unreleased --strip header > /tmp/nightly-changelog.md 2>/dev/null || true
-          fi
-          # Collapse to empty if git-cliff produced only whitespace/heading noise.
-          if ! grep -qE '^- ' /tmp/nightly-changelog.md; then
-            : > /tmp/nightly-changelog.md
-          fi
-      - name: Tag libxmtp hub
-        if: steps.guard.outputs.should-release == 'true'
-        run: xmtp-release tag-release --sdk libxmtp --version "${{ steps.hubver.outputs.version }}" --ignore-if-exists
-      - name: Create hub GitHub Release
+      - name: Publish hub release
         if: steps.guard.outputs.should-release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HUB_VERSION: ${{ steps.hubver.outputs.version }}
+          RELEASE_TYPE: ${{ needs.validate.outputs.release-type }}
           IOS_VERSION: ${{ needs.release-ios.outputs.version }}
           ANDROID_VERSION: ${{ needs.release-android.outputs.version }}
           NODE_VERSION: ${{ needs.release-node-sdk.outputs.binding-version }}
           WASM_VERSION: ${{ needs.release-browser-sdk.outputs.binding-version }}
           AGENT_VERSION: ${{ needs.release-agent-sdk.outputs.version }}
+          PENDING_VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          BODY=$(cat <<EOF
-          ## libxmtp ${HUB_VERSION}
-
-          Nightly release. SDKs shipped from this libxmtp release:
-
+          TAG="libxmtp-${PENDING_VERSION}"
+          TITLE="libxmtp ${PENDING_VERSION}"
+          NOTES=$(cat <<EOF
           | SDK | Version |
-          | --- | --- |
+          |-----|---------|
           | iOS | ${IOS_VERSION:-—} |
           | Android | ${ANDROID_VERSION:-—} |
           | Node | ${NODE_VERSION:-—} |
-          | WASM | ${WASM_VERSION:-—} |
+          | Browser | ${WASM_VERSION:-—} |
           | Agent | ${AGENT_VERSION:-—} |
-
-          See per-SDK release notes under \`docs/release-notes/\`.
           EOF
           )
-          # Append the per-nightly changelog (delta since the previous nightly),
-          # if git-cliff produced any entries.
-          if [ -s /tmp/nightly-changelog.md ]; then
-            BODY="${BODY}
-
-          ## Changes since the last nightly
-
-          $(cat /tmp/nightly-changelog.md)"
-          fi
-          if gh release view "v${HUB_VERSION}" >/dev/null 2>&1; then
-            gh release edit "v${HUB_VERSION}" \
-              --title "libxmtp ${HUB_VERSION}" \
-              --notes "$BODY" \
-              --prerelease
-          else
-            gh release create "v${HUB_VERSION}" \
-              --title "libxmtp ${HUB_VERSION}" \
-              --notes "$BODY" \
-              --prerelease
-          fi
-
-  notify:
-    needs: [validate, plan, hub, release-ios, release-android, release-node-sdk, release-browser-sdk, release-agent-sdk, merge-pr]
-    if: always() && needs.validate.outputs.skip != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - id: compute
-        env:
-          IOS_RESULT: ${{ needs.release-ios.result }}
-          IOS_VERSION: ${{ needs.release-ios.outputs.version }}
-          ANDROID_RESULT: ${{ needs.release-android.result }}
-          ANDROID_VERSION: ${{ needs.release-android.outputs.version }}
-          NODE_RESULT: ${{ needs.release-node-sdk.result }}
-          NODE_VERSION: ${{ needs.release-node-sdk.outputs.binding-version }}
-          WASM_RESULT: ${{ needs.release-browser-sdk.result }}
-          WASM_VERSION: ${{ needs.release-browser-sdk.outputs.binding-version }}
-          AGENT_RESULT: ${{ needs.release-agent-sdk.result }}
-          AGENT_VERSION: ${{ needs.release-agent-sdk.outputs.version }}
-          RELEASE_TYPE: ${{ needs.validate.outputs.release-type }}
-        run: |
-          MSG="${RELEASE_TYPE^} Release:"
-          if [ -n "$IOS_VERSION" ] || [ "$IOS_RESULT" != "skipped" ]; then
-            MSG="$MSG iOS ${IOS_VERSION:-failed} (${IOS_RESULT})"
-          fi
-          if [ -n "$ANDROID_VERSION" ] || [ "$ANDROID_RESULT" != "skipped" ]; then
-            MSG="$MSG Android ${ANDROID_VERSION:-failed} (${ANDROID_RESULT})"
-          fi
-          if [ -n "$NODE_VERSION" ] || [ "$NODE_RESULT" != "skipped" ]; then
-            MSG="$MSG Node ${NODE_VERSION:-failed} (${NODE_RESULT})"
-          fi
-          if [ -n "$WASM_VERSION" ] || [ "$WASM_RESULT" != "skipped" ]; then
-            MSG="$MSG WASM ${WASM_VERSION:-failed} (${WASM_RESULT})"
-          fi
-          if [ -n "$AGENT_VERSION" ] || [ "$AGENT_RESULT" != "skipped" ]; then
-            MSG="$MSG Agent ${AGENT_VERSION:-failed} (${AGENT_RESULT})"
-          fi
-          echo "message=$MSG" >> "$GITHUB_OUTPUT"
-      - uses: ./.github/actions/slack-notify
-        with:
-          message: ${{ steps.compute.outputs.message }}
-          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          gh release create "$TAG" --title "$TITLE" --notes "$NOTES" --target "${{ needs.validate.outputs.ref }}"
