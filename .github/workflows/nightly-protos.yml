@@ -1,7 +1,7 @@
 name: Nightly Automation
 on:
-  schedule:
-    - cron:  '0 10 * * 1'
+  # Fork maintenance: upstream's scheduled proto updater requires write/PR automation
+  # that this fork does not need. Keep manual dispatch available when explicitly wanted.
   workflow_dispatch:
 jobs:
   nightly-protos:
