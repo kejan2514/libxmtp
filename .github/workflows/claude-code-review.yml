@@ -15,10 +15,9 @@ concurrency:
 
 jobs:
   claude-review:
-    # The Claude action requires the PR author to have write access to the upstream repo.
-    # Fork PRs run under the fork author's identity, which makes automated review fail
-    # during the action's permission preflight.
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    # The Claude GitHub App is configured upstream, not inherited by fork repositories.
+    # Also exclude incoming fork PRs, whose authors may lack upstream write access.
+    if: ${{ !github.event.repository.fork && github.event.pull_request.head.repo.full_name == github.repository }}
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
