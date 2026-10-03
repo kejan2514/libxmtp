@@ -21,6 +21,8 @@ concurrency:
 
 jobs:
   changelog-pr:
+    # Upstream release automation is not needed on this fork.
+    if: github.repository == 'xmtp/libxmtp'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
